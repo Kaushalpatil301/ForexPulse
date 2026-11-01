@@ -42,3 +42,4 @@ jobs:
       - name: Build Frontend Production Bundle
         working-directory: ./frontend
         run: npm run build
+

@@ -50,3 +50,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Initial release with multi-source ingestion (`open.er-api.com`, `fawazahmed0/currency-api`, `frankfurter.dev`).
 - In-flight request deduplication and 5-minute memory cache.
 - Render 1-click blueprint deployment.
+
