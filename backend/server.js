@@ -17,10 +17,17 @@ app.use((req, res, next) => {
 });
 
 app.get('/health', (req, res) => res.json({ status: 'ok', uptime: process.uptime() }));
+
 const CACHE_TTL = 5 * 60 * 1000;           // serve from cache for 5 min: protects rate limits
 const HOUR = 3600e3;
 const DEFAULT_SYMBOLS = ['EUR', 'GBP', 'INR', 'JPY', 'AUD', 'CAD', 'CHF', 'AED', 'SGD'];
 const BASE_RE = /^[A-Z]{3}$/;
+
+// Base-currency whitelist to protect upstream APIs from arbitrary query abuse
+const ALLOWED_CURRENCIES = new Set([
+  'USD', 'EUR', 'GBP', 'INR', 'JPY', 'AUD', 'CAD', 'CHF', 'AED', 'SGD',
+  'NZD', 'CNY', 'HKD', 'SEK', 'NOK', 'MXN', 'BRL', 'ZAR', 'KRW', 'THB'
+]);
 
 const cache = new Map();     // base -> { ok, failed, fetchedAt }   (last known good)
 const inflight = new Map();  // base -> Promise (dedupe concurrent refreshes)
@@ -47,10 +54,31 @@ function freshness(asOf) {
   return 'stale';
 }
 
+function getFreshnessLabel(status, sourcesOk, ageMs) {
+  if (status === 'live') return 'Live Interbank Rate';
+  if (sourcesOk.some((s) => s.includes('hourly')) && ageMs <= 2 * HOUR) return 'Hourly Market Rate';
+  if (status === 'fresh') return 'Daily Central Bank & Market Rate';
+  if (status === 'aging') return 'Aging Reference Rate (Weekend/Holiday)';
+  return 'Outdated Reference Rate';
+}
+
 app.get('/api/rates', async (req, res) => {
   const base = String(req.query.base || 'USD').toUpperCase();
-  if (!BASE_RE.test(base)) return res.status(400).json({ error: 'Invalid base currency' });
-  const symbols = (req.query.symbols ? String(req.query.symbols).split(',') : DEFAULT_SYMBOLS).map((s) => s.trim().toUpperCase()).filter((s) => BASE_RE.test(s) && s !== base).slice(0, 30);
+  
+  // Whitelist and input guard: protect upstream endpoints from malformed or unsupported currencies
+  if (!BASE_RE.test(base) || !ALLOWED_CURRENCIES.has(base)) {
+    return res.status(400).json({
+      error: `Unsupported or invalid base currency '${base}'. Supported: ${Array.from(ALLOWED_CURRENCIES).join(', ')}`,
+      code: 'INVALID_BASE'
+    });
+  }
+
+  const rawSymbols = req.query.symbols ? String(req.query.symbols).split(',') : DEFAULT_SYMBOLS;
+  const symbols = rawSymbols
+    .map((s) => s.trim().toUpperCase())
+    .filter((s) => BASE_RE.test(s) && ALLOWED_CURRENCIES.has(s) && s !== base)
+    .slice(0, 30);
+
   const highIntent = req.query.intent === 'high';
   const clientId = req.ip;
 
@@ -71,21 +99,35 @@ app.get('/api/rates', async (req, res) => {
 
     const degraded = !!snap && (snap.allFailed || snap.failed.length > 0);
     const status = premium ? 'live' : freshness(asOf);
+    const sourceNames = sources.map((s) => s.name);
+    const freshnessLabel = getFreshnessLabel(status, sourceNames, Date.now() - asOf);
+    
     const message =
       snap?.allFailed ? 'Our rate providers are unreachable. Showing the last rates we successfully fetched.'
       : status === 'stale' ? 'These rates are more than 2 days old. Treat them as indicative only.'
-      : status === 'aging' ? 'Rates are a bit behind. Free rates update about once a day.'
+      : status === 'aging' ? 'Rates are a bit behind (weekend/holiday lag). Free rates update about once a day.'
       : degraded ? 'Some providers are down; rates were cross-checked from the remaining ones.'
       : 'Free-tier rates update about once a day. Upgrade for real-time.';
+
+    const lastCheckedAt = snap?.fetchedAt ?? Date.now();
+    const lastCheckedSeconds = Math.round((Date.now() - lastCheckedAt) / 1000);
 
     res.json({
       base, rates,
       meta: {
-        status, degraded, message,
-        asOf, ageSeconds: Math.round((Date.now() - asOf) / 1000),
-        fetchedAt: snap?.fetchedAt ?? Date.now(), servedFromCache: !!snap?.fromCache,
+        status,
+        freshnessLabel,
+        degraded,
+        message,
+        asOf,
+        asOfFormatted: new Date(asOf).toUTCString(),
+        ageSeconds: Math.round((Date.now() - asOf) / 1000),
+        lastCheckedAt,
+        lastCheckedSeconds,
+        servedFromCache: !!snap?.fromCache,
         premiumUsed: !!premium,
-        sourcesOk: sources.map((s) => s.name), sourcesFailed: snap?.failed ?? [],
+        sourcesOk: sourceNames,
+        sourcesFailed: snap?.failed ?? [],
         premiumBudget: premiumStatus(),
       },
     });
@@ -95,6 +137,19 @@ app.get('/api/rates', async (req, res) => {
   }
 });
 
+// Cache warm-up on boot: guarantees the very first visitor gets sub-10ms response without cold-start delay
+async function warmupCache() {
+  console.log('[Warmup] Pre-warming cache for default bases (USD, EUR, GBP)...');
+  for (const b of ['USD', 'EUR', 'GBP']) {
+    try {
+      await getSnapshot(b);
+      console.log(`[Warmup] ✓ Pre-cached rates for ${b}`);
+    } catch (e) {
+      console.warn(`[Warmup] Warning for ${b}:`, e.message);
+    }
+  }
+}
+
 // Serve the built React app in production (single deploy).
 const dist = path.join(path.dirname(fileURLToPath(import.meta.url)), '../frontend/dist');
 if (fs.existsSync(dist)) {
@@ -102,4 +157,7 @@ if (fs.existsSync(dist)) {
   app.get('*', (_, res) => res.sendFile(path.join(dist, 'index.html')));
 }
 
-app.listen(PORT, () => console.log(`FX service on :${PORT}`));
+app.listen(PORT, () => {
+  console.log(`FX service on :${PORT}`);
+  warmupCache();
+});
