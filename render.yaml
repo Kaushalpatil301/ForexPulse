@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: forex-rate-tracker
+    runtime: node
+    plan: free
+    buildCommand: cd frontend && npm install && npm run build && cd ../backend && npm install
+    startCommand: node backend/server.js
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000
+      - key: PREMIUM_DAILY_CALLS
+        value: 5000
