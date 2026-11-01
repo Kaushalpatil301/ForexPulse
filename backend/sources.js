@@ -40,8 +40,14 @@ export const SOURCES = [
           throw new Error('Invalid payload structure: missing result or rates');
         }
 
+        const rates = Object.fromEntries(
+          Object.entries(raw.rates)
+            .filter(([k]) => /^[A-Za-z]{3}$/.test(k))
+            .map(([k, v]) => [k.toUpperCase(), Number(v)])
+        );
+
         const normalized = {
-          rates: raw.rates,
+          rates,
           asOf: raw.time_last_update_unix ? raw.time_last_update_unix * 1000 : Date.now()
         };
 
@@ -77,7 +83,9 @@ export const SOURCES = [
         }
 
         const rates = Object.fromEntries(
-          Object.entries(raw[b]).map(([k, v]) => [k.toUpperCase(), Number(v)])
+          Object.entries(raw[b])
+            .filter(([k]) => /^[A-Za-z]{3}$/.test(k))
+            .map(([k, v]) => [k.toUpperCase(), Number(v)])
         );
 
         const normalized = {
@@ -115,8 +123,15 @@ export const SOURCES = [
           throw new Error('Invalid payload structure: missing rates');
         }
 
+        const rawRates = { ...raw.rates, [base]: 1 };
+        const rates = Object.fromEntries(
+          Object.entries(rawRates)
+            .filter(([k]) => /^[A-Za-z]{3}$/.test(k))
+            .map(([k, v]) => [k.toUpperCase(), Number(v)])
+        );
+
         const normalized = {
-          rates: { ...raw.rates, [base]: 1 },
+          rates,
           asOf: raw.date ? Date.parse(raw.date) : Date.now()
         };
 
