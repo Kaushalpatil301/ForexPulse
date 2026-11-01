@@ -2,7 +2,7 @@
 
 A currency exchange rate service that stays up when public APIs don't, and tells users how fresh the rates are.
 
-**Live demo:** [forexpulse.onrender.com](https://forexpulse.onrender.com) · **Decisions and tradeoffs:** [decisions.md](decisions.md) · **My approach:** [MY_APPROACH.md](MY_APPROACH.md)
+**Live demo:** [forexpulse-tc01.onrender.com](https://forexpulse-tc01.onrender.com) · **Decisions and tradeoffs:** [decisions.md](decisions.md) · **My approach:** [MY_APPROACH.md](MY_APPROACH.md)
 
 ![ForexPulse UI Preview](https://img.shields.io/badge/Status-Live%20%26%20Resilient-emerald?style=for-the-badge)
 
