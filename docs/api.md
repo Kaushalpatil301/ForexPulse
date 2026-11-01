@@ -116,3 +116,4 @@ GET /api/rates
   "code": "ALL_SOURCES_DOWN"
 }
 ```
+

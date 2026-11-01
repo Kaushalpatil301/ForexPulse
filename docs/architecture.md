@@ -62,3 +62,4 @@ Public rates occasionally suffer from inverted ratios or temporary upstream bugs
 | **Corrupted Upstream Feed** | 1 rogue ($>2\%$ off) | Resolved live | 🟢 Consensus rate shown with subtle `⚠️ median` indicator. Zero errors. | `200 OK` |
 | **Total Cloud/Network Outage** | 3/3 Unreachable | Cache available (>5m old) | 🟡 **Last-Known-Good Served.** Amber banner explains: *"Providers temporarily unreachable. Showing verified rates from 14 mins ago."* | `200 OK` (degraded) |
 | **Cold Boot Total Outage** | 3/3 Unreachable | Cache empty | 🔴 Branded error card with an actionable **"Retry Connection"** button. | `503 Service Unavailable` |
+
