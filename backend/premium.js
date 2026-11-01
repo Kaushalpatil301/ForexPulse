@@ -1,31 +1,59 @@
-// Budgeted premium access for free users. Integration point only: enabled when PREMIUM_API_URL is set.
-// Expected response: { rates: {CUR: number}, timestamp: unix_seconds }
-const DAILY_LIMIT = Number(process.env.PREMIUM_DAILY_CALLS || 5000); // ~$5/day at $0.001/call
-const PER_USER_DAILY = Number(process.env.PREMIUM_PER_USER || 10);
+// FP-01, FP-03, FP-04, FP-08, FP-10: Enterprise-grade Premium Engine
+import { defaultQuotaStore } from './quotaStore.js';
+import { validateProviderData } from './validator.js';
 
-let day = '', used = 0;
-const perUser = new Map();
-
-const rollDay = () => {
-  const today = new Date().toISOString().slice(0, 10);
-  if (today !== day) { day = today; used = 0; perUser.clear(); }
+export const getPremiumStatus = () => {
+  return {
+    enabled: Boolean(process.env.PREMIUM_API_URL),
+    ...defaultQuotaStore.getStatus()
+  };
 };
 
-export const premiumStatus = () => { rollDay(); return { enabled: !!process.env.PREMIUM_API_URL, used, limit: DAILY_LIMIT }; };
+export async function tryPremium(base, clientId = 'anonymous') {
+  if (!process.env.PREMIUM_API_URL) {
+    return null;
+  }
 
-export async function tryPremium(base, clientId) {
-  rollDay();
-  if (!process.env.PREMIUM_API_URL) return null;
-  if (used >= DAILY_LIMIT) return null;
-  if ((perUser.get(clientId) || 0) >= PER_USER_DAILY) return null;
-  used++; perUser.set(clientId, (perUser.get(clientId) || 0) + 1);
+  // FP-10: Check quota allowance BEFORE calling the API, but do NOT decrement yet
+  const allowance = defaultQuotaStore.canSpend(clientId);
+  if (!allowance.allowed) {
+    return null; // Budget exhausted or user limit reached -> graceful fail-open
+  }
+
   try {
-    const r = await fetch(`${process.env.PREMIUM_API_URL}?base=${base}`, {
-      headers: { Authorization: `Bearer ${process.env.PREMIUM_API_KEY || ''}` },
-      signal: AbortSignal.timeout(2500),
+    const res = await fetch(`${process.env.PREMIUM_API_URL}?base=${base}`, {
+      headers: {
+        Authorization: `Bearer ${process.env.PREMIUM_API_KEY || ''}`,
+        'Content-Type': 'application/json'
+      },
+      signal: AbortSignal.timeout(2500)
     });
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    const d = await r.json();
-    return { rates: d.rates, asOf: (d.timestamp || Date.now() / 1000) * 1000 };
-  } catch { return null; } // fall through to free sources
+
+    if (!res.ok) {
+      throw new Error(`Premium HTTP ${res.status}`);
+    }
+
+    const raw = await res.json();
+
+    // FP-08: Validate premium payload strictly
+    const normalized = {
+      rates: raw.rates,
+      asOf: raw.timestamp ? raw.timestamp * 1000 : Date.now()
+    };
+
+    const validated = validateProviderData(normalized, 'premium');
+
+    // FP-10: Atomically commit quota ONLY after successful upstream validation
+    defaultQuotaStore.commitUsage(clientId);
+
+    return {
+      name: 'premium',
+      isPremium: true,
+      rates: validated.rates,
+      asOf: validated.asOf
+    };
+  } catch (err) {
+    // If premium fails or times out, quota is NOT consumed, falls back to free
+    return null;
+  }
 }

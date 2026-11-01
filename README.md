@@ -24,15 +24,17 @@ When looking at the low 2% conversion and 40 support tickets a week, I realized 
 ---
 
 ## Features
-- **One endpoint**, `GET /api/rates`, backed by several real public APIs queried in parallel with timeouts
-- If one source is **more than 2% away** from the others, the median is used and the rate is flagged
-- **5-minute in-memory cache**, with concurrent requests for the same currency sharing one upstream call (request deduplication)
-- **Falls back to the last successful rates** when every source fails
-- **Freshness badge**, "as of" time, and clear messages for stale and degraded states
-- **Premium API calls** only for "Refresh now" and large conversions, with a daily cap and a per-user cap (disabled unless configured)
-- **Cache warm-up on boot** so the very first visitor gets sub-10ms response
-- **Tab visibility pause** to prevent wasted background polling when the browser tab is hidden
-- **Single-pair converter** with an instant `⇄ Swap` button and one-click `📋 Copy` to clipboard
+- **One endpoint**, `GET /api/rates`, backed by real public APIs queried in parallel with circuit breakers and retries (FP-13, FP-14)
+- **Robust outlier consensus**: Median & Median Absolute Deviation (MAD) with modified Z-score thresholds (FP-02)
+- **Validated premium prioritization**: Explicit priority for validated live premium rates (FP-01)
+- **5-minute cache with Stale-While-Revalidate (SWR)** and concurrent request deduplication (FP-15, FP-28)
+- **Falls back to last-known-good rates** when upstream feeds fail (FP-23)
+- **Freshness badge & dual timestamps** ("rates as of" vs "last checked") defusing support inquiries
+- **Persistent atomic quota tracking** surviving process restarts and committing budget only on verified success (FP-03, FP-10)
+- **Cache warm-up on boot** so the very first visitor gets a sub-10ms response
+- **Tab visibility pause** preventing wasted polling when the browser tab is hidden
+- **Single-pair converter** with an instant `⇄ Swap` button and one-click `📋 Copy`
+- **15 automated reliability tests passing** covering consensus, failure states, quotas, and validation (FP-21 to FP-34)
 
 ---
 

@@ -18,17 +18,17 @@ Having multiple independent upstream providers guarantees that no single provide
 
 ## 2. What's your fallback strategy when an API fails?
 We implement a multi-tiered resilience ladder:
-1. **Parallel Multi-Fetch with Hard Timeouts:**
-   All candidate sources are queried concurrently via `Promise.allSettled()` with a strict 3,000ms timeout (`AbortSignal.timeout(3000)`). A slow or hanging external provider never delays the overall response.
-2. **In-Flight Request Deduplication:**
+1. **Parallel Multi-Fetch with Hard Timeouts & Circuit Breakers (FP-13, FP-14):**
+   All candidate sources are queried concurrently via `Promise.allSettled()` with a strict 3,000ms timeout (`AbortSignal.timeout(3000)`). Each provider is monitored by a dedicated `CircuitBreaker`. If a provider fails 3 consecutive times, it is temporarily skipped for 25 seconds to protect request latency. Transient failures receive controlled retries with exponential backoff.
+2. **In-Flight Request Deduplication (FP-28):**
    If 200 users concurrently request USD exchange rates during a traffic surge, `inflight.set(base, promise)` collapses these into a single upstream request cycle. Once resolved, the result is shared across all waiting requests. This prevents the "thundering herd" problem and shields public rate limits.
-3. **5-Minute In-Memory Cache:**
-   All successful aggregations are cached in memory for 300 seconds. This drastically cuts latency to <5ms for 99% of requests and avoids 429 IP rate limits from free API hosts.
+3. **5-Minute In-Memory Cache with Stale-While-Revalidate (FP-15):**
+   All successful aggregations are cached in memory for 300 seconds. Between 3 and 5 minutes, the cache serves data instantly (<5ms) while triggering an asynchronous background refresh (SWR), ensuring zero-latency transitions.
 4. **Boot-Time Cache Warm-Up:**
    On server startup, the background worker automatically pre-warms the cache for the top base currencies (`USD`, `EUR`, `GBP`). The very first visitor to the site receives an instantaneous (<5ms) cached response rather than experiencing cold-start lag.
-5. **Last-Known-Good Fallback:**
+5. **Last-Known-Good Fallback (FP-23):**
    If all live upstream fetches fail simultaneously (e.g. cloud provider network glitch), the system immediately serves the most recent cached snapshot with `degraded: true` and an explicit timestamp banner. The user never encounters a blank screen or broken table.
-6. **Cold-Start 503 Guard:**
+6. **Cold-Start 503 Guard (FP-24):**
    Only in the extreme event of a cold server restart during a 100% total upstream outage does the API return a structured 503 (`ALL_SOURCES_DOWN`) with a friendly retryable payload.
 
 ---
@@ -36,13 +36,16 @@ We implement a multi-tiered resilience ladder:
 ## 3. How do you handle conflicting data from different sources?
 Public APIs often differ slightly due to differences in market closing times, spread definitions, or fixing hours (e.g. ECB fixing vs London fixing). However, a broken upstream could occasionally emit corrupted data or inverted pairs.
 
-- **Timestamp Prioritization:**
-  For each currency pair, rates are sorted by timestamp (`asOf`). The freshest valid source is chosen as the primary candidate.
-- **Median Consensus & Outlier Detection:**
-  The primary candidate rate is compared against the median of all other responding providers.
-  $$\text{Deviation} = \frac{|\text{primary} - \text{median}|}{\text{median}}$$
-  - If deviation $\le 2\%$: The primary candidate is verified by consensus and accepted.
-  - If deviation $> 2\%$: The primary candidate is treated as an anomaly or rogue feed. The system automatically overrides it with the mathematical **median of all sources**, flags `disputed: true`, and informs the client UI with a warning annotation (`⚠️ median`).
+- **Explicit Premium Prioritization (FP-01):**
+  When a high-intent request validates premium data, the validated premium rate is explicitly selected as the primary rate, taking precedence over free feeds.
+- **Timestamp Prioritization for Free Feeds:**
+  For each currency pair, free rates are sorted by timestamp (`asOf`), prioritizing the newest valid source.
+- **Robust Statistical Consensus via Median & MAD (FP-02):**
+  Instead of fragile percentage differences, we calculate the Median ($M$) and Median Absolute Deviation ($MAD$):
+  $$MAD = \text{median}(|r_i - M|)$$
+  When $MAD > 0$, we calculate the modified Z-score:
+  $$Z_i = \frac{0.6745 \times |r_i - M|}{MAD}$$
+  An outlier is flagged if $Z_i > 3.5$ OR relative deviation exceeds $2\%$. The system automatically rejects the rogue feed, enforces the mathematical **median of all sources**, flags `disputed: true`, and annotates the client UI (`⚠️ median`). When only 2 sources disagree by $>2\%$, the median average is taken and marked disputed for safety.
 
 ---
 

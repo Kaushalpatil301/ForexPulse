@@ -3,161 +3,228 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
 import { fetchAll, merge } from './aggregate.js';
-import { tryPremium, premiumStatus } from './premium.js';
+import { tryPremium, getPremiumStatus } from './premium.js';
+import { defaultForexCache } from './cache.js';
+import { RatesQuerySchema, ALLOWED_CURRENCIES } from './validator.js';
+import { createRateLimiter } from './rateLimiter.js';
+import { PROVIDER_CIRCUIT_BREAKERS, PROVIDER_METRICS } from './sources.js';
 
-const app = express();
+export const app = express();
 const PORT = process.env.PORT || 3001;
 
-// CORS headers to support decoupled deployments (e.g. Vercel frontend + Render backend)
+// FP-17: Configurable, Secure CORS
+const allowedOrigins = process.env.CORS_ORIGIN ? process.env.CORS_ORIGIN.split(',').map((s) => s.trim()) : ['*'];
+
 app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
-  if (req.method === 'OPTIONS') return res.sendStatus(200);
+  const origin = req.headers.origin;
+  if (allowedOrigins.includes('*') || (origin && allowedOrigins.includes(origin))) {
+    res.header('Access-Control-Allow-Origin', origin || '*');
+  }
+  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
+  res.header('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
 
-app.get('/health', (req, res) => res.json({ status: 'ok', uptime: process.uptime() }));
+// FP-16: Rate Limiting (120 req / min per IP)
+app.use(createRateLimiter({ windowMs: 60000, maxRequests: 120 }));
 
-const CACHE_TTL = 5 * 60 * 1000;           // serve from cache for 5 min: protects rate limits
-const HOUR = 3600e3;
-const DEFAULT_SYMBOLS = ['EUR', 'GBP', 'INR', 'JPY', 'AUD', 'CAD', 'CHF', 'AED', 'SGD'];
-const BASE_RE = /^[A-Z]{3}$/;
+// FP-18: Structured Request Logging & Observability
+app.use((req, res, next) => {
+  const start = Date.now();
+  const reqId = Math.random().toString(36).slice(2, 9);
+  req.reqId = reqId;
 
-// Base-currency whitelist to protect upstream APIs from arbitrary query abuse
-const ALLOWED_CURRENCIES = new Set([
-  'USD', 'EUR', 'GBP', 'INR', 'JPY', 'AUD', 'CAD', 'CHF', 'AED', 'SGD',
-  'NZD', 'CNY', 'HKD', 'SEK', 'NOK', 'MXN', 'BRL', 'ZAR', 'KRW', 'THB'
-]);
+  res.on('finish', () => {
+    const duration = Date.now() - start;
+    if (req.path.startsWith('/api') || req.path.startsWith('/health')) {
+      console.log(JSON.stringify({
+        level: res.statusCode >= 500 ? 'error' : res.statusCode >= 400 ? 'warn' : 'info',
+        reqId,
+        method: req.method,
+        path: req.originalUrl,
+        status: res.statusCode,
+        durationMs: duration,
+        ip: req.ip
+      }));
+    }
+  });
+  next();
+});
 
-const cache = new Map();     // base -> { ok, failed, fetchedAt }   (last known good)
-const inflight = new Map();  // base -> Promise (dedupe concurrent refreshes)
+// FP-19: Separated Health & Observability Endpoints
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', uptime: process.uptime(), timestamp: Date.now() });
+});
 
-async function getSnapshot(base) {
-  const hit = cache.get(base);
-  if (hit && Date.now() - hit.fetchedAt < CACHE_TTL) return { ...hit, fromCache: true };
-  if (!inflight.has(base)) {
-    inflight.set(base, fetchAll(base).then((r) => {
-      if (r.ok.length) cache.set(base, { ...r, fetchedAt: Date.now() });
-      return r;
-    }).finally(() => inflight.delete(base)));
+app.get('/health/live', (req, res) => {
+  res.json({ status: 'live', pid: process.pid, uptime: process.uptime() });
+});
+
+app.get('/health/ready', (req, res) => {
+  const breakers = Object.fromEntries(
+    Object.entries(PROVIDER_CIRCUIT_BREAKERS).map(([k, v]) => [k, v.getStats().state])
+  );
+  const allOpen = Object.values(breakers).every((state) => state === 'OPEN');
+  if (allOpen) {
+    return res.status(503).json({ status: 'not_ready', reason: 'ALL_PROVIDERS_TRIPPED', breakers });
   }
-  const r = await inflight.get(base);
-  if (r.ok.length) return { ...cache.get(base), fromCache: false };
-  if (hit) return { ...hit, fromCache: true, allFailed: true }; // serve last-known-good
-  return null;
-}
+  res.json({ status: 'ready', breakers, cacheKeys: defaultForexCache.cache.size });
+});
 
-function freshness(asOf) {
-  const age = Date.now() - asOf;
-  if (age <= 25 * HOUR) return 'fresh';  // free sources publish daily; this is as current as free gets
-  if (age <= 49 * HOUR) return 'aging';
-  return 'stale';
-}
+app.get('/metrics', (req, res) => {
+  res.json({
+    uptime: process.uptime(),
+    cache: defaultForexCache.getStats(),
+    circuitBreakers: Object.fromEntries(
+      Object.entries(PROVIDER_CIRCUIT_BREAKERS).map(([k, v]) => [k, v.getStats()])
+    ),
+    providerMetrics: PROVIDER_METRICS,
+    premium: getPremiumStatus()
+  });
+});
 
-function getFreshnessLabel(status, sourcesOk, ageMs) {
-  if (status === 'live') return 'Live Interbank Rate';
-  if (sourcesOk.some((s) => s.includes('hourly')) && ageMs <= 2 * HOUR) return 'Hourly Market Rate';
-  if (status === 'fresh') return 'Daily Central Bank & Market Rate';
-  if (status === 'aging') return 'Aging Reference Rate (Weekend/Holiday)';
-  return 'Outdated Reference Rate';
-}
-
+// Primary Currency Rates Endpoint
 app.get('/api/rates', async (req, res) => {
-  const base = String(req.query.base || 'USD').toUpperCase();
-  
-  // Whitelist and input guard: protect upstream endpoints from malformed or unsupported currencies
-  if (!BASE_RE.test(base) || !ALLOWED_CURRENCIES.has(base)) {
+  // FP-11 & FP-20: Strict Zod Input Validation & Edge Case Handling
+  const queryResult = RatesQuerySchema.safeParse(req.query);
+  if (!queryResult.success) {
+    const rawIssues = queryResult.error.issues || queryResult.error.errors || [];
+    const issues = rawIssues.map((e) => ({
+      field: (e.path || []).join('.'),
+      message: e.message
+    }));
     return res.status(400).json({
-      error: `Unsupported or invalid base currency '${base}'. Supported: ${Array.from(ALLOWED_CURRENCIES).join(', ')}`,
-      code: 'INVALID_BASE'
+      error: `Validation failed: ${issues.map((i) => i.message).join('; ')}`,
+      code: 'INVALID_INPUT',
+      details: issues,
+      supportedCurrencies: ALLOWED_CURRENCIES
     });
   }
 
-  const rawSymbols = req.query.symbols ? String(req.query.symbols).split(',') : DEFAULT_SYMBOLS;
-  const symbols = rawSymbols
-    .map((s) => s.trim().toUpperCase())
-    .filter((s) => BASE_RE.test(s) && ALLOWED_CURRENCIES.has(s) && s !== base)
-    .slice(0, 30);
-
-  const highIntent = req.query.intent === 'high';
-  const clientId = req.ip;
+  const { base, symbols, intent, amount } = queryResult.data;
+  const highIntent = intent === 'high';
+  const clientId = req.ip || '127.0.0.1';
 
   try {
-    // Spend premium budget only at high-intent moments (manual refresh / large conversions).
-    let premium = null;
-    if (highIntent) premium = await tryPremium(base, clientId);
+    // FP-01, FP-05, FP-10: Budgeted Premium routing for high-intent requests
+    let premiumData = null;
+    if (highIntent) {
+      premiumData = await tryPremium(base, clientId);
+    }
 
-    const snap = await getSnapshot(base);
-    if (!snap && !premium) {
-      return res.status(503).json({ error: 'Rates are temporarily unavailable. Please try again in a minute.', code: 'ALL_SOURCES_DOWN' });
+    // FP-15: Query multi-source cache with SWR and last-known-good
+    const snap = await defaultForexCache.get(base, fetchAll);
+
+    // If both cache/providers and premium are unavailable, return clean 503
+    if (!snap && !premiumData) {
+      return res.status(503).json({
+        error: 'Rates are temporarily unavailable. Please try again in a minute.',
+        code: 'ALL_SOURCES_DOWN'
+      });
     }
 
     const sources = snap ? [...snap.ok] : [];
-    if (premium) sources.push({ name: 'premium', ...premium });
-    const rates = merge(sources, symbols);
-    const asOf = Math.max(...Object.values(rates).map((r) => r.asOf), 0);
+    if (premiumData) {
+      sources.push(premiumData);
+    }
 
-    const degraded = !!snap && (snap.allFailed || snap.failed.length > 0);
-    const status = premium ? 'live' : freshness(asOf);
-    const sourceNames = sources.map((s) => s.name);
-    const freshnessLabel = getFreshnessLabel(status, sourceNames, Date.now() - asOf);
-    
+    // FP-01 & FP-02: Robust Consensus with MAD Outlier Rejection & Premium Prioritization
+    const { rates, freshnessMetrics } = merge(sources, symbols);
+
+    // Handle conversion calculation if requested
+    const converted = {};
+    if (amount !== undefined && amount >= 0) {
+      for (const [sym, r] of Object.entries(rates)) {
+        converted[sym] = Number((r.rate * amount).toFixed(4));
+      }
+    }
+
+    const degraded = Boolean(snap && (snap.allFailed || (snap.failed && snap.failed.length > 0)));
+    const status = premiumData ? 'live' : freshnessMetrics.overallFreshness;
+    const sourcesOk = sources.map((s) => s.name);
+    const sourcesFailed = snap?.failed || [];
+
     const message =
-      snap?.allFailed ? 'Our rate providers are unreachable. Showing the last rates we successfully fetched.'
-      : status === 'stale' ? 'These rates are more than 2 days old. Treat them as indicative only.'
-      : status === 'aging' ? 'Rates are a bit behind (weekend/holiday lag). Free rates update about once a day.'
-      : degraded ? 'Some providers are down; rates were cross-checked from the remaining ones.'
-      : 'Free-tier rates update about once a day. Upgrade for real-time.';
-
-    const lastCheckedAt = snap?.fetchedAt ?? Date.now();
-    const lastCheckedSeconds = Math.round((Date.now() - lastCheckedAt) / 1000);
+      snap?.allFailed
+        ? 'Our rate providers are unreachable. Showing the last rates we successfully fetched.'
+        : status === 'stale'
+        ? 'These rates are more than 2 days old. Treat them as indicative only.'
+        : status === 'aging'
+        ? 'Rates are a bit behind (weekend/holiday lag). Free rates update about once a day.'
+        : degraded
+        ? 'Some providers are temporarily down; rates were cross-checked from the remaining feeds.'
+        : 'Free-tier rates update about once a day. Upgrade to Pro for sub-second live streaming.';
 
     res.json({
-      base, rates,
+      base,
+      amount,
+      rates,
+      converted,
       meta: {
         status,
-        freshnessLabel,
+        freshnessLabel:
+          status === 'live'
+            ? 'Live Interbank Rate'
+            : sourcesOk.some((s) => s.includes('hourly'))
+            ? 'Hourly Market Rate'
+            : status === 'fresh'
+            ? 'Daily Central Bank & Market Rate'
+            : status === 'aging'
+            ? 'Aging Reference Rate (Weekend/Holiday)'
+            : 'Outdated Reference Rate',
         degraded,
         message,
-        asOf,
-        asOfFormatted: new Date(asOf).toUTCString(),
-        ageSeconds: Math.round((Date.now() - asOf) / 1000),
-        lastCheckedAt,
-        lastCheckedSeconds,
-        servedFromCache: !!snap?.fromCache,
-        premiumUsed: !!premium,
-        sourcesOk: sourceNames,
-        sourcesFailed: snap?.failed ?? [],
-        premiumBudget: premiumStatus(),
-      },
+        asOf: freshnessMetrics.newestAsOf,
+        oldestAsOf: freshnessMetrics.oldestAsOf,
+        medianAsOf: freshnessMetrics.medianAsOf,
+        asOfFormatted: new Date(freshnessMetrics.newestAsOf).toUTCString(),
+        ageSeconds: Math.max(0, Math.round((Date.now() - freshnessMetrics.newestAsOf) / 1000)),
+        lastCheckedAt: snap?.fetchedAt || Date.now(),
+        lastCheckedSeconds: Math.max(0, Math.round((Date.now() - (snap?.fetchedAt || Date.now())) / 1000)),
+        servedFromCache: Boolean(snap?.fromCache),
+        isSWR: Boolean(snap?.isSWR),
+        premiumUsed: Boolean(premiumData),
+        sourcesOk,
+        sourcesFailed,
+        premiumBudget: getPremiumStatus()
+      }
     });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: 'Unexpected error', code: 'INTERNAL' });
+  } catch (err) {
+    console.error('Unhandled request error:', err);
+    res.status(500).json({ error: 'Unexpected server error', code: 'INTERNAL_ERROR' });
   }
 });
 
-// Cache warm-up on boot: guarantees the very first visitor gets sub-10ms response without cold-start delay
-async function warmupCache() {
-  console.log('[Warmup] Pre-warming cache for default bases (USD, EUR, GBP)...');
-  for (const b of ['USD', 'EUR', 'GBP']) {
+// Cache pre-warming for default currencies on boot
+export async function warmupCache() {
+  const warmupBases = ['USD', 'EUR', 'GBP'];
+  for (const b of warmupBases) {
     try {
-      await getSnapshot(b);
-      console.log(`[Warmup] ✓ Pre-cached rates for ${b}`);
-    } catch (e) {
-      console.warn(`[Warmup] Warning for ${b}:`, e.message);
+      await defaultForexCache.get(b, fetchAll);
+    } catch {
+      // Non-fatal
     }
   }
 }
 
-// Serve the built React app in production (single deploy).
+// Serve production React bundle
 const dist = path.join(path.dirname(fileURLToPath(import.meta.url)), '../frontend/dist');
 if (fs.existsSync(dist)) {
   app.use(express.static(dist));
-  app.get('*', (_, res) => res.sendFile(path.join(dist, 'index.html')));
+  app.get('*', (req, res, next) => {
+    if (req.path.startsWith('/api') || req.path.startsWith('/health') || req.path.startsWith('/metrics')) {
+      return next();
+    }
+    res.sendFile(path.join(dist, 'index.html'));
+  });
 }
 
-app.listen(PORT, () => {
-  console.log(`FX service on :${PORT}`);
-  warmupCache();
-});
+// Start server only when run directly (enables supertest to import app without binding port)
+const isMainModule = process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1]);
+if (isMainModule) {
+  app.listen(PORT, () => {
+    console.log(`ForexPulse API running on :${PORT}`);
+    warmupCache();
+  });
+}
