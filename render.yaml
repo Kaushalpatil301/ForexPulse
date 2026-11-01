@@ -12,3 +12,4 @@ services:
         value: 10000
       - key: PREMIUM_DAILY_CALLS
         value: 5000
+
